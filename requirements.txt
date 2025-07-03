@@ -1,0 +1,5 @@
+colorama
+prompt_toolkit
+rich
+openpyxl
+reportlab 
