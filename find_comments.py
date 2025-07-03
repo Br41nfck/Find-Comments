@@ -88,7 +88,7 @@ import subprocess
 import shutil
 from collections import Counter, defaultdict
 from html import escape
-from colorama import init, Fore, Style
+from colorama import init, Fore, Style as ColoramaStyle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -481,6 +481,7 @@ def scan_dir(root, extensions, ignore_words=None, ignore_regex=None, show_progre
     all_files = []
     errors = []
     root_depth = root.rstrip(os.sep).count(os.sep)
+    script_path = os.path.abspath(__file__)
     for dirpath, _, filenames in os.walk(root):
         if max_depth is not None:
             cur_depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
@@ -489,12 +490,13 @@ def scan_dir(root, extensions, ignore_words=None, ignore_regex=None, show_progre
                 continue
         for fname in filenames:
             ext = os.path.splitext(fname)[1].lower()
+            fpath = os.path.join(dirpath, fname)
             if any(word.lower() in fname.lower() for word in ignore_words):
                 continue
             if ignore_re and ignore_re.search(fname):
                 continue
-            if ext in extensions:
-                all_files.append(os.path.join(dirpath, fname))
+            if ext in extensions and os.path.abspath(fpath) != script_path:
+                all_files.append(fpath)
     total = len(all_files)
     all_comments = []
     cache = load_cache(cache_path) if use_cache else {}
@@ -602,13 +604,13 @@ def print_comments_from_grouped(grouped, show_content=False, highlight_words=Non
     highlight_words — список ключевых слов для подсветки (регистронезависимо).
     """
     init(autoreset=True)
-    BLUE = Fore.BLUE + Style.BRIGHT
-    YELLOW = Fore.YELLOW + Style.BRIGHT
-    GREEN = Fore.GREEN + Style.BRIGHT
-    RED = Fore.RED + Style.BRIGHT
-    MAGENTA = Fore.MAGENTA + Style.BRIGHT
-    CYAN = Fore.CYAN + Style.BRIGHT
-    RESET = Style.RESET_ALL
+    BLUE = Fore.BLUE + ColoramaStyle.BRIGHT
+    YELLOW = Fore.YELLOW + ColoramaStyle.BRIGHT
+    GREEN = Fore.GREEN + ColoramaStyle.BRIGHT
+    RED = Fore.RED + ColoramaStyle.BRIGHT
+    MAGENTA = Fore.MAGENTA + ColoramaStyle.BRIGHT
+    CYAN = Fore.CYAN + ColoramaStyle.BRIGHT
+    RESET = ColoramaStyle.RESET_ALL
     if highlight_words is None:
         highlight_words = ['TODO', 'FIXME', 'BUG', 'HACK', 'NOTE', 'WARNING']
     highlight_res = [re.compile(rf'(?i)\\b{re.escape(word)}\\b') for word in highlight_words]
@@ -853,7 +855,9 @@ def main():
         else:
             plugin_patterns = {}
         # Фильтруем по расширениям, если указаны --ext
-        files_to_scan = [f for f in expanded_files if os.path.splitext(f)[1].lower() in set(args.ext)]
+        # Не сканировать сам скрипт 
+        script_path = os.path.abspath(__file__)
+        files_to_scan = [f for f in expanded_files if os.path.splitext(f)[1].lower() in set(args.ext) and os.path.abspath(f) != script_path]
         all_files = files_to_scan
         errors = []
         all_comments = []
