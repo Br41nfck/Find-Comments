@@ -937,6 +937,9 @@ def main():
                 'txt': save_txt,
                 'prettytxt': save_pretty_txt,
             }
+        if args.format == 'prettytxt':
+            save_pretty_txt(comments, args.out)
+        else:
             save_map[args.format](grouped, args.out)
             print(L['saved'].format(out=args.out, fmt=args.format))
             # Явно выводим путь сохранения
