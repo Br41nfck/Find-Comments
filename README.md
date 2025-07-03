@@ -1,6 +1,3 @@
-# AutoTest
-AutoTest for Forsite/Digital Razor
-
 # find_comments.py
 
 Универсальный инструмент для поиска, анализа и экспорта комментариев в исходном коде.
