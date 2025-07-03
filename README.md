@@ -1,5 +1,5 @@
 # Русская документация по find_comments.py
-
+(pull-requests и issues приветствуются!!!) <br>
 Универсальный инструмент для поиска, анализа и экспорта комментариев в исходном коде.
 
 ## Возможности
@@ -174,7 +174,7 @@ MIT
 ---
 
 # ENGLISH DOC find_comments.py
-
+(pull-requests and issues are welcome!!!) <br>
 Universal tool for searching, analyzing, and exporting comments in source code.
 
 ## Features
