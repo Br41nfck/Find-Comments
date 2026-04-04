@@ -92,7 +92,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple, Optional, Set
 
 # Version
-VERSION = "1.0.0"
+VERSION = "1.5.0"
 
 # Try to import optional dependencies
 try:
