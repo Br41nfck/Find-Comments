@@ -5,71 +5,6 @@ find_comments.py — универсальный инструмент для по
 Автор: Trix
 GitHub: https://github.com/Br41nfck/Find-Comments
 Version: 1.5.0
-
-Параметры:
-  --root DIR                        Где искать файлы (по умолчанию — текущая папка)
-  --ext EXT [EXT ...]               Какие расширения файлов анализировать
-  --ignore WORD [...]               Не анализировать файлы, если в имени есть эти слова
-  --ignore-regex REGEX              Не анализировать файлы, если имя подходит под regex
-  --only TYPE [...]                 Искать только определённые типы комментариев: single, multi, triple_slash, warning
-  --contains PATTERN [PATTERN ...]  Только комментарии, содержащие слова/regex
-  --min-lines N                     Только блоки длиннее N строк
-  --show-progress                   Показывать прогресс (по умолчанию)
-  --no-progress                     Не показывать прогресс
-  --workers N                       Сколько потоков использовать (по умолчанию 4)
-  --out FILE                        Куда сохранить результат
-  --format FMT                      Формат вывода: prettytxt, txt, csv, json, html
-  --include-symbols                 Оставлять символы комментариев и теги (///, //, #, <summary> и др.)
-  --show-content                    Показывать только текст комментариев (без файла/строк)
-  --fail-on PATTERN [...]           Завершать с ошибкой, если найден комментарий с этими словами/regex
-  --lang LANG                       Язык сообщений: ru (по умолчанию) или en
-  --files FILE [FILE ...]           Список файлов для анализа (заменяет --root, --ext и др.)
-  --filelist FILE                   Путь к файлу со списком файлов для анализа (по одному в строке)
-  --highlight KEY [KEY ...]         Подсвечивать эти слова в выводе (без учёта регистра)
-  --max-depth N                     Максимальная глубина рекурсивного обхода директорий (по умолчанию: 1)
-  --plugin PLUGIN [PLUGIN ...]      Пути к .py-файлам плагинов (каждый должен экспортировать get_patterns())
-  --report TYPE                     Генерировать аналитический отчёт (md, csv, txt, html, xlsx, pdf, json)
-  --report-out FILE                 Сохранять отчёт в файл (по умолчанию — вывод в консоль)
-  --interactive                     Интерактивный просмотр
-  --support-lang                    Показать поддерживаемые языки и форматы комментариев и выйти
-  --edit FILE LINE                  Открыть файл в редакторе на нужной строке и выйти
-  --version                         Показать версию и выйти
-
-Возможности:
-- Находит однострочные и многострочные комментарии во множестве языков программирования.
-- Умеет группировать подряд идущие однострочные комментарии (например, /// в C#).
-- Позволяет фильтровать комментарии по типу, содержимому, длине блока.
-- Работает только с нужными расширениями файлов.
-- Может исключать файлы по словам или регулярным выражениям в имени.
-- Использует многопоточность для ускорения анализа больших проектов.
-- Кэширует результаты для ускорения повторных запусков.
-- Красиво выводит результат в консоль (цвета!) и сохраняет в prettytxt, txt, csv, json, html.
-- Поддерживает русский и английский языки интерфейса.
-- Может использоваться в CI/CD (завершение с ошибкой при определённых комментариях).
-- Гибко настраивается через аргументы командной строки.
-
-Примеры использования:
-  # Найти TODO и FIXME в Python и JS
-  python find_comments.py --ext .py .js --contains TODO FIXME
-
-  # Сохранить prettytxt-отчёт без символов комментариев
-  python find_comments.py --ignore test temp --format prettytxt --out comments.txt
-
-  # Завершить с ошибкой, если найден TODO, и вывести только текст
-  python find_comments.py --fail-on TODO --show-content
-
-  # Английский язык, 8 потоков, игнорировать файлы с test
-  python find_comments.py --lang en --workers 8 --ignore-regex ".*test.*"
-
-  # Сохранить prettytxt-отчёт с символами комментариев
-  python find_comments.py --include-symbols --format prettytxt --out comments.txt
-
-  # Только большие блоки (от 3 строк)
-  python find_comments.py --min-lines 3
-
-  # Только многострочные комментарии в C/C++
-  python find_comments.py --ext .c .cpp --only multi
-
 """
 
 import os
@@ -89,55 +24,86 @@ import threading
 from collections import Counter, defaultdict
 from html import escape
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Tuple, Optional, Set
+from typing import List, Dict, Any, Tuple, Optional, Set, Union, TYPE_CHECKING
 
 # Version
 VERSION = "1.5.0"
 
 # Try to import optional dependencies
 try:
-    from colorama import init, Fore, Style as ColoramaStyle
+    from colorama import init, Fore, Style as ColoramaBase  # type: ignore
     init(autoreset=True)
+    ColoramaStyle = ColoramaBase  # type: ignore
 except ImportError:
-    # Fallback if colorama not installed
-    class ColoramaStyle:
+    class ColoramaStyle:  # type: ignore
         RESET_ALL = ''
-    class Fore:
+    
+    ColoramaBase = ColoramaStyle  # type: ignore
+    class Fore:  # type: ignore
         BLUE = YELLOW = GREEN = RED = MAGENTA = CYAN = ''
-    def init(autoreset=True):
+    def init(autoreset: bool = True) -> None:  # type: ignore
         pass
 
 try:
-    import openpyxl
-    from openpyxl.styles import Font
+    import openpyxl  # type: ignore
+    from openpyxl.styles import Font  # type: ignore
 except ImportError:
-    openpyxl = None
+    openpyxl = None  # type: ignore
+    Font = None  # type: ignore
 
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import mm
+    from reportlab.lib.pagesizes import A4 as A4_SIZE
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.units import mm as MM_UNIT
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    from reportlab.lib import colors
+    from reportlab.lib import colors as rl_colors
+    REPORTLAB_AVAILABLE = True
+    A4 = A4_SIZE
+    mm = MM_UNIT
+    canvas = rl_canvas
+    colors = rl_colors
 except ImportError:
-    A4 = canvas = mm = getSampleStyleSheet = SimpleDocTemplate = Paragraph = Spacer = Table = TableStyle = colors = None
+    REPORTLAB_AVAILABLE = False
+    A4 = None  # type: ignore
+    canvas = None  # type: ignore
+    mm = None  # type: ignore
+    getSampleStyleSheet = None  # type: ignore
+    SimpleDocTemplate = None  # type: ignore
+    Paragraph = None  # type: ignore
+    Spacer = None  # type: ignore
+    Table = None  # type: ignore
+    TableStyle = None  # type: ignore
+    colors = None  # type: ignore
 
 try:
-    from prompt_toolkit.application import Application
+    from prompt_toolkit.application import Application as PTApplication
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import Layout
     from prompt_toolkit.layout.containers import HSplit, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.widgets import Frame
-    from prompt_toolkit.styles import Style
+    from prompt_toolkit.styles import Style as PTStyle
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.shortcuts.dialogs import checkboxlist_dialog
     from prompt_toolkit.shortcuts import input_dialog, message_dialog
     PROMPT_TOOLKIT_AVAILABLE = True
+    Application = PTApplication
+    Style = PTStyle
 except ImportError:
     PROMPT_TOOLKIT_AVAILABLE = False
-    Application = KeyBindings = Layout = HSplit = Window = FormattedTextControl = Frame = Style = HTML = checkboxlist_dialog = input_dialog = message_dialog = None
+    Application = None  # type: ignore
+    KeyBindings = None  # type: ignore
+    Layout = None  # type: ignore
+    HSplit = None  # type: ignore
+    Window = None  # type: ignore
+    FormattedTextControl = None  # type: ignore
+    Frame = None  # type: ignore
+    Style = None  # type: ignore
+    HTML = None  # type: ignore
+    checkboxlist_dialog = None  # type: ignore
+    input_dialog = None  # type: ignore
+    message_dialog = None  # type: ignore
 
 try:
     from rich.console import Console
@@ -146,7 +112,9 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-    Console = Syntax = Text = None
+    Console = None  # type: ignore
+    Syntax = None  # type: ignore
+    Text = None  # type: ignore
 
 try:
     import pyperclip
@@ -154,6 +122,23 @@ try:
 except ImportError:
     PYPERCLIP_AVAILABLE = False
     pyperclip = None
+
+# Компилируемые regex паттерны (кэш для оптимизации)
+_REGEX_CACHE: Dict[str, re.Pattern] = {}
+
+def _get_compiled_regex(pattern: str) -> re.Pattern:  # type: ignore
+    """Получает скомпилированный regex из кэша или компилирует новый"""
+    if pattern not in _REGEX_CACHE:
+        _REGEX_CACHE[pattern] = re.compile(pattern)
+    return _REGEX_CACHE[pattern]
+
+# Предкомпилированные паттерны для оптимизации
+_COMMENT_SYMBOL_PATTERN = re.compile(r'^\s*(///+|//+|#+|/\*+|\*+/)')
+_SUMMARY_TAG_PATTERN = re.compile(r'</?summary>', re.IGNORECASE)
+_DISPLAY_SYMBOLS_PATTERN = re.compile(r'^\s*(///+|//+|#+|/\*+|\*+/)')
+_DISPLAY_TAGS_PATTERN = re.compile(r'<!--+|-->|<summary>|</summary>', re.IGNORECASE)
+_DISPLAY_HTML_PATTERN = re.compile(r'<.*?>')
+_HIGHLIGHT_PATTERN_CACHE: Dict[str, re.Pattern] = {}  # type: ignore
 
 # Словарь: расширение -> список паттернов комментариев (однострочные, многострочные)
 COMMENT_PATTERNS = {
@@ -372,7 +357,7 @@ class GitHelpFormatter(argparse.HelpFormatter):
         return ', '.join(parts)
 
 
-def get_patterns_for_ext(ext: str, plugin_patterns: Dict = None) -> List[Dict]:
+def get_patterns_for_ext(ext: str, plugin_patterns: Optional[Dict] = None) -> List[Dict]:
     """Возвращает список паттернов комментариев для расширения файла"""
     pats = COMMENT_PATTERNS.get(ext, []).copy()
     if plugin_patterns and ext in plugin_patterns:
@@ -382,72 +367,71 @@ def get_patterns_for_ext(ext: str, plugin_patterns: Dict = None) -> List[Dict]:
 
 def find_comments_in_file(filepath: str, patterns: List[Dict]) -> List[Dict]:
     """Находит все комментарии в файле по заданным паттернам"""
-    results = []
+    results: List[Dict] = []
     try:
         with open(filepath, encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
     except Exception:
         return results
     
-    # Для многострочных комментариев
-    for pat in patterns:
-        if pat['type'] == 'multi':
-            start_pat = re.compile(pat['start'])
-            end_pat = re.compile(pat['end'])
-            inside = False
-            comment_lines = []
-            start_line = 0
-            for idx, line in enumerate(lines):
-                if not inside and start_pat.search(line):
-                    inside = True
-                    start_line = idx + 1
-                    comment_lines = [line.rstrip('\n')]
-                    if end_pat.search(line) and start_pat.pattern != end_pat.pattern:
-                        results.append({
-                            'file': filepath,
-                            'line': start_line,
-                            'end_line': idx + 1,
-                            'text': line.strip(),
-                            'type': 'multi',
-                        })
-                        inside = False
-                        comment_lines = []
-                elif inside:
-                    comment_lines.append(line.rstrip('\n'))
-                    if end_pat.search(line):
-                        results.append({
-                            'file': filepath,
-                            'line': start_line,
-                            'end_line': idx + 1,
-                            'text': '\n'.join(comment_lines),
-                            'type': 'multi',
-                        })
-                        inside = False
-                        comment_lines = []
-            
-            if inside:
-                results.append({
-                    'file': filepath,
-                    'line': start_line,
-                    'end_line': len(lines),
-                    'text': '\n'.join(comment_lines) + '\n[WARNING: Многострочный комментарий не закрыт!]',
-                    'type': 'warning',
-                })
+    # Предкомпилируем паттерны для оптимизации
+    compiled_multi = [(re.compile(pat['start']), re.compile(pat['end'])) for pat in patterns if pat['type'] == 'multi']
+    compiled_single = [re.compile(pat['pattern']) for pat in patterns if pat['type'] == 'single']
     
-    # Для однострочных комментариев
-    for pat in patterns:
-        if pat['type'] == 'single':
-            regex = re.compile(pat['pattern'])
-            for idx, line in enumerate(lines):
-                m = regex.search(line)
-                if m:
+    # Для многострочных комментариев
+    for start_pat, end_pat in compiled_multi:
+        inside = False
+        comment_lines: List[str] = []
+        start_line = 0
+        for idx, line in enumerate(lines):
+            if not inside and start_pat.search(line):
+                inside = True
+                start_line = idx + 1
+                comment_lines = [line.rstrip('\n')]
+                if end_pat.search(line) and start_pat.pattern != end_pat.pattern:
                     results.append({
                         'file': filepath,
-                        'line': idx + 1,
+                        'line': start_line,
                         'end_line': idx + 1,
-                        'text': m.group().strip(),
-                        'type': 'single',
+                        'text': line.strip(),
+                        'type': 'multi',
                     })
+                    inside = False
+                    comment_lines = []
+            elif inside:
+                comment_lines.append(line.rstrip('\n'))
+                if end_pat.search(line):
+                    results.append({
+                        'file': filepath,
+                        'line': start_line,
+                        'end_line': idx + 1,
+                        'text': '\n'.join(comment_lines),
+                        'type': 'multi',
+                    })
+                    inside = False
+                    comment_lines = []
+        
+        if inside:
+            results.append({
+                'file': filepath,
+                'line': start_line,
+                'end_line': len(lines),
+                'text': '\n'.join(comment_lines) + '\n[WARNING: Многострочный комментарий не закрыт!]',
+                'type': 'warning',
+            })
+    
+    # Для однострочных комментариев
+    for regex in compiled_single:
+        for idx, line in enumerate(lines):
+            m = regex.search(line)
+            if m:
+                results.append({
+                    'file': filepath,
+                    'line': idx + 1,
+                    'end_line': idx + 1,
+                    'text': m.group().strip(),
+                    'type': 'single',
+                })
     return results
 
 
@@ -488,17 +472,17 @@ def clean_comment_line(line: str, include_symbols: bool = False) -> str:
     """Очищает строку комментария от символов комментариев"""
     if include_symbols:
         return line.strip()
-    line = re.sub(r'^\s*(///+|//+|#+|/\*+|\*+/)', '', line)
-    line = re.sub(r'<\/?summary>', '', line, flags=re.IGNORECASE)
+    line = _COMMENT_SYMBOL_PATTERN.sub('', line)
+    line = _SUMMARY_TAG_PATTERN.sub('', line)
     return line.strip()
 
 
 def group_comments(comments: List[Dict], include_symbols: bool = False) -> List[Dict]:
     """Группирует подряд идущие комментарии в блоки"""
-    grouped = []
+    grouped: List[Dict] = []
     i = 0
     n = len(comments)
-    used = set()
+    used: Set[Tuple[str, int]] = set()
     
     while i < n:
         c = comments[i]
@@ -510,7 +494,7 @@ def group_comments(comments: List[Dict], include_symbols: bool = False) -> List[
         if c['file'].endswith('.cs') and c['text'].startswith('///'):
             start = i
             end = i
-            block_lines = []
+            block_lines: List[str] = []
             txt = clean_comment_line(c['text'], include_symbols)
             if txt:
                 block_lines.append(txt)
@@ -550,28 +534,34 @@ def group_comments(comments: List[Dict], include_symbols: bool = False) -> List[
     return grouped
 
 
+# Кэш для скомпилированных regex паттернов в highlight_text
+_HIGHLIGHT_PATTERN_CACHE: Dict[str, re.Pattern] = {}  # type: ignore
+
 def highlight_text(text: str, highlight_words: List[str]) -> str:
     """Подсвечивает ключевые слова в тексте"""
     colors = [Fore.RED, Fore.MAGENTA, Fore.CYAN, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
     for i, word in enumerate(highlight_words):
         if not word:
             continue
-        color = colors[i % len(colors)] + ColoramaStyle.BRIGHT
-        pattern = re.compile(rf'(?i)\b{re.escape(word)}\b')
-        text = pattern.sub(lambda m: color + m.group(0) + ColoramaStyle.RESET_ALL, text)
+        # Используем кэш для скомпилированных паттернов
+        if word not in _HIGHLIGHT_PATTERN_CACHE:
+            _HIGHLIGHT_PATTERN_CACHE[word] = re.compile(rf'(?i)\b{re.escape(word)}\b')
+        pattern = _HIGHLIGHT_PATTERN_CACHE[word]
+        color = colors[i % len(colors)] + getattr(ColoramaStyle, 'BRIGHT', '')
+        text = pattern.sub(lambda m: color + m.group(0) + getattr(ColoramaStyle, 'RESET_ALL', ''), text)
     return text
 
 
 def print_comments_from_grouped(grouped: List[Dict], show_content: bool = False, 
-                                highlight_words: List[str] = None) -> None:
+                                highlight_words: Optional[List[str]] = None) -> None:
     """Красиво печатает сгруппированные комментарии в консоль"""
     if highlight_words is None:
         highlight_words = ['TODO', 'FIXME', 'BUG', 'HACK', 'NOTE', 'WARNING']
     
-    BLUE = Fore.BLUE + ColoramaStyle.BRIGHT
-    YELLOW = Fore.YELLOW + ColoramaStyle.BRIGHT
-    GREEN = Fore.GREEN + ColoramaStyle.BRIGHT
-    RESET = ColoramaStyle.RESET_ALL
+    BLUE = Fore.BLUE + getattr(ColoramaStyle, 'BRIGHT', '')
+    YELLOW = Fore.YELLOW + getattr(ColoramaStyle, 'BRIGHT', '')
+    GREEN = Fore.GREEN + getattr(ColoramaStyle, 'BRIGHT', '')
+    RESET = getattr(ColoramaStyle, 'RESET_ALL', '')
     
     for block in grouped:
         lines = [highlight_text(line, highlight_words) for line in block['lines']]
@@ -621,7 +611,7 @@ def save_html(comments: List[Dict], filename: str) -> None:
         for c in comments:
             f.write(f'<tr><td>{escape(c["file"])}</td><td>{c["line"]}</td><td>{c["end_line"]}</td>'
                    f'<td><pre>{escape(c["text"])}</pre></td></tr>')
-        f.write('</table></body></html>')
+        f.write('</tr></body></html>')
 
 
 def save_pretty_txt(comments: List[Dict], filename: str) -> None:
@@ -665,8 +655,9 @@ def save_csv_from_grouped(grouped: List[Dict], filename: str) -> None:
         writer = csv.writer(f)
         writer.writerow(['file', 'start_line', 'end_line', 'type', 'text'])
         for block in grouped:
-            writer.writerow([block['file'], block['start_line'], block['end_line'], 
-                           block['type'], '\n'.join(block['lines'])])
+            if isinstance(block.get('lines'), list):
+                writer.writerow([block['file'], block['start_line'], block['end_line'], 
+                               block['type'], '\n'.join(block['lines'])])
 
 
 def save_json_from_grouped(grouped: List[Dict], filename: str) -> None:
@@ -699,34 +690,36 @@ def save_txt_from_grouped(grouped: List[Dict], filename: str) -> None:
 
 def load_plugins(plugin_paths: List[str]) -> Dict:
     """Загружает плагины из списка путей"""
-    plugin_patterns = {}
+    plugin_patterns: Dict = {}
     for path in plugin_paths:
         try:
             spec = importlib.util.spec_from_file_location("plugin_module", path)
-            if spec and spec.loader:
-                plugin = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(plugin)
-                if hasattr(plugin, 'get_patterns'):
-                    patterns = plugin.get_patterns()
-                    if isinstance(patterns, dict):
-                        for ext, pats in patterns.items():
-                            if ext not in plugin_patterns:
-                                plugin_patterns[ext] = []
-                            plugin_patterns[ext].extend(pats)
+            if not spec or not spec.loader:
+                continue
+            plugin = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin)
+            if not hasattr(plugin, 'get_patterns'):
+                continue
+            patterns = plugin.get_patterns()
+            if isinstance(patterns, dict):
+                for ext, pats in patterns.items():
+                    if ext not in plugin_patterns:
+                        plugin_patterns[ext] = []
+                    plugin_patterns[ext].extend(pats)
         except Exception as e:
             print(f"[PLUGIN ERROR] {path}: {e}")
     return plugin_patterns
 
 
 def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'md', 
-                   filename: str = None) -> Optional[str]:
+                   filename: Optional[str] = None) -> Optional[Union[str, bytes]]:
     """Генерирует аналитический отчёт по комментариям"""
     
     # Считаем статистику
     type_counter = Counter()
     file_counter = Counter()
     total_lines = 0
-    file_lines = defaultdict(int)
+    file_lines: Dict[str, int] = defaultdict(int)
     
     for block in grouped:
         type_counter[block['type']] += 1
@@ -799,17 +792,17 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
         report = '\n'.join(lines)
         
     elif report_type == 'xlsx':
-        if openpyxl is None:
+        if openpyxl is None or Font is None:
             print('Для экспорта в xlsx установите пакет openpyxl')
             return None
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = 'Аналитика'
-        ws.append(['Файл', 'Комментариев', 'Строк'])
+        wb = openpyxl.Workbook()  # type: ignore
+        ws = wb.active  # type: ignore
+        ws.title = 'Аналитика'  # type: ignore
+        ws.append(['Файл', 'Комментариев', 'Строк'])  # type: ignore
         for f in sorted(file_counter, key=lambda x: -file_counter[x]):
-            ws.append([f, file_counter[f], file_lines.get(f, '?')])
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
+            ws.append([f, file_counter[f], file_lines.get(f, '?')])  # type: ignore
+        for cell in ws[1]:  # type: ignore
+            cell.font = Font(bold=True)  # type: ignore
         if filename:
             wb.save(filename)
             return None
@@ -834,26 +827,22 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
         }, ensure_ascii=False, indent=2)
         
     elif report_type == 'pdf':
-        if None in (SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, colors):
+        if not REPORTLAB_AVAILABLE or SimpleDocTemplate is None or Paragraph is None or Spacer is None or Table is None or TableStyle is None or colors is None:
             print('Для экспорта в pdf установите пакет reportlab')
             return None
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib import colors
         
         story = []
-        styles = getSampleStyleSheet()
-        story.append(Paragraph('Аналитика по комментариям', styles['Title']))
+        styles = getSampleStyleSheet()  # type: ignore
+        story.append(Paragraph('Аналитика по комментариям', styles['Title']))  # type: ignore
         story.append(Paragraph(f'Всего файлов: {len(files)}<br/>Всего блоков комментариев: {comments_total}<br/>'
-                              f'Комментариев на 1000 строк кода: {comments_per_kloc:.2f}', styles['Normal']))
-        story.append(Spacer(1, 8))
-        story.append(Paragraph('Распределение по типам:', styles['Heading2']))
+                              f'Комментариев на 1000 строк кода: {comments_per_kloc:.2f}', styles['Normal']))  # type: ignore
+        story.append(Spacer(1, 8))  # type: ignore
+        story.append(Paragraph('Распределение по типам:', styles['Heading2']))  # type: ignore
         data = [['Тип', 'Количество']]
         for t, n in type_counter.most_common():
             data.append([str(t), str(n)])
-        table = Table(data)
-        table.setStyle(TableStyle([
+        table = Table(data)  # type: ignore
+        table.setStyle(TableStyle([  # type: ignore
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -862,13 +851,13 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
         ]))
         story.append(table)
-        story.append(Spacer(1, 8))
-        story.append(Paragraph('Топ-10 файлов по количеству комментариев:', styles['Heading2']))
+        story.append(Spacer(1, 8))  # type: ignore
+        story.append(Paragraph('Топ-10 файлов по количеству комментариев:', styles['Heading2']))  # type: ignore
         data = [['Файл', 'Комментариев', 'Строк']]
         for f, n in file_counter.most_common(10):
             data.append([f, str(n), str(file_lines.get(f, '?'))])
-        table = Table(data)
-        table.setStyle(TableStyle([
+        table = Table(data)  # type: ignore
+        table.setStyle(TableStyle([  # type: ignore
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -877,13 +866,13 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
         ]))
         story.append(table)
-        story.append(Spacer(1, 8))
-        story.append(Paragraph('Распределение по файлам:', styles['Heading2']))
+        story.append(Spacer(1, 8))  # type: ignore
+        story.append(Paragraph('Распределение по файлам:', styles['Heading2']))  # type: ignore
         data = [['Файл', 'Комментариев', 'Строк']]
         for f in sorted(file_counter, key=lambda x: -file_counter[x]):
             data.append([f, str(file_counter[f]), str(file_lines.get(f, '?'))])
-        table = Table(data)
-        table.setStyle(TableStyle([
+        table = Table(data)  # type: ignore
+        table.setStyle(TableStyle([  # type: ignore
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
@@ -894,13 +883,13 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
         story.append(table)
         
         if filename:
-            doc = SimpleDocTemplate(filename, pagesize=A4)
+            doc = SimpleDocTemplate(filename, pagesize=A4)  # type: ignore
             doc.build(story)
             return None
         else:
             import io
             buf = io.BytesIO()
-            doc = SimpleDocTemplate(buf, pagesize=A4)
+            doc = SimpleDocTemplate(buf, pagesize=A4)  # type: ignore
             doc.build(story)
             return buf.getvalue()
     else:  # txt
@@ -926,7 +915,7 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
     
     if filename and report_type not in ('xlsx', 'pdf'):
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write(report)
+            f.write(report)  # type: ignore
         return None
     return report
 
@@ -958,7 +947,7 @@ def preview_code_around_comment(block: Dict, context: int = 3, use_rich: bool = 
 
 def find_comment_block_in_code(code_lines: List[str], comment_lines: List[str]) -> Set[int]:
     """Ищет блок комментария в коде"""
-    indices = set()
+    indices: Set[int] = set()
     if not comment_lines:
         return indices
     
@@ -967,16 +956,27 @@ def find_comment_block_in_code(code_lines: List[str], comment_lines: List[str]) 
     n = len(code_stripped)
     m = len(comment_stripped)
     
+    if m > n:
+        return indices
+    
+    # Оптимизация: проверяем только если есть вероятность совпадения
     for i in range(n - m + 1):
         if code_stripped[i:i+m] == comment_stripped:
             indices.update(range(i, i+m))
+            break  # Находим первое совпадение и выходим
     return indices
 
 
+# Предкомпилированные regex паттерны для очистки
+_DISPLAY_SYMBOLS_PATTERN = re.compile(r'^\s*(///+|//+|#+|/\*+|\*+/)')
+_DISPLAY_TAGS_PATTERN = re.compile(r'<!--+|-->|<summary>|</summary>', re.IGNORECASE)
+_DISPLAY_HTML_PATTERN = re.compile(r'<.*?>')
+
 def clean_comment_for_display(line: str) -> str:
     """Очищает комментарий для отображения"""
-    line = re.sub(r'^\s*(///+|//+|#+|/\*+|\*+/|<!--+|-->|<summary>|</summary>)', '', line, flags=re.IGNORECASE)
-    line = re.sub(r'<.*?>', '', line)
+    line = _DISPLAY_SYMBOLS_PATTERN.sub('', line)
+    line = _DISPLAY_TAGS_PATTERN.sub('', line)
+    line = _DISPLAY_HTML_PATTERN.sub('', line)
     return line.strip()
 
 
@@ -992,7 +992,7 @@ def interactive_viewer(grouped: List[Dict]) -> None:
     filter_type = [None]
     search_term = ['']
     
-    style = Style.from_dict({
+    style = Style.from_dict({  # type: ignore
         'frame': 'bg:#222222 #ffffff',
         'title': 'bold underline',
         'comment': 'ansigreen',
@@ -1045,21 +1045,21 @@ def interactive_viewer(grouped: List[Dict]) -> None:
             idx[0] = 0
             return [('', f'Нет комментариев для отображения (ошибка: {e}).\n[→] Next  [←] Prev  [F]ilter  [S]earch  [O]pen file  [A]ll open  [E]xport  [C]opy code  [G]o to  [Q]uit')]
     
-    kb = KeyBindings()
+    kb = KeyBindings()  # type: ignore
     
-    @kb.add('right')
+    @kb.add('right')  # type: ignore  # noqa
     def _(event):
         if filtered[0]:
             idx[0] = (idx[0] + 1) % len(filtered[0])
             event.app.invalidate()
     
-    @kb.add('left')
-    def _(event):
+    @kb.add('left')  # type: ignore  # noqa
+    def _(event: Any) -> None:
         if filtered[0]:
             idx[0] = (idx[0] - 1) % len(filtered[0])
             event.app.invalidate()
     
-    @kb.add('f')
+    @kb.add('f')  # type: ignore  # noqa
     async def _(event):
         allowed_types = [
             ('single', 'single'),
@@ -1068,25 +1068,25 @@ def interactive_viewer(grouped: List[Dict]) -> None:
             ('summary', 'summary'),
             ('warning', 'warning')
         ]
-        result = await checkboxlist_dialog(
+        result = await checkboxlist_dialog(  # type: ignore
             title='Фильтр по типу',
             text='Выберите типы комментариев для фильтрации (пробел — выбрать, Enter — применить, Esc — сброс):',
             values=allowed_types
-        ).run_async()
+        ).run_async()  # type: ignore
         if result:
             filtered[0] = [b for b in grouped if b['type'] in result]
             idx[0] = 0
-            filter_type[0] = ','.join(result)
+            filter_type[0] = ','.join(result)  # type: ignore
         else:
             filtered[0] = grouped
             idx[0] = 0
-            filter_type[0] = None
+            filter_type[0] = None  # type: ignore
         event.app.invalidate()
     
-    @kb.add('s')
-    async def _(event):
-        s = await input_dialog(title='Поиск', text='Поиск (пусто — сброс):').run_async()
-        if s:
+    @kb.add('s')  # type: ignore  # noqa
+    async def _(event: Any) -> None:
+        s = await input_dialog(title='Поиск', text='Поиск (пусто — сброс):').run_async()  # type: ignore
+        if s and isinstance(s, str):
             filtered[0] = [b for b in grouped if any(s.lower() in line.lower() for line in b['lines'])]
             idx[0] = 0
             search_term[0] = s
@@ -1096,11 +1096,11 @@ def interactive_viewer(grouped: List[Dict]) -> None:
             search_term[0] = ''
         event.app.invalidate()
     
-    @kb.add('e')
-    async def _(event):
-        fmt = await input_dialog(title='Экспорт', text='Формат экспорта (md/csv/txt/html/json/pdf):').run_async()
-        fname = await input_dialog(title='Экспорт', text='Имя файла для экспорта:').run_async()
-        if fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
+    @kb.add('e')  # type: ignore  # noqa
+    async def _(event: Any) -> None:
+        fmt = await input_dialog(title='Экспорт', text='Формат экспорта (md/csv/txt/html/json/pdf):').run_async()  # type: ignore
+        fname = await input_dialog(title='Экспорт', text='Имя файла для экспорта:').run_async()  # type: ignore
+        if fmt and isinstance(fmt, str) and fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
             generate_report(filtered[0], sorted(set(b['file'] for b in filtered[0])), report_type=fmt, filename=fname)
         event.app.invalidate()
     
@@ -1120,24 +1120,24 @@ def interactive_viewer(grouped: List[Dict]) -> None:
             except Exception:
                 pass
     
-    @kb.add('a')
-    def _(event):
-        files = sorted(set(b['file'] for b in filtered[0]))
-        for f in files:
+    @kb.add('a')  # type: ignore  # noqa
+    def _(event: Any) -> None:
+        files_to_open = sorted(set(b['file'] for b in filtered[0]))
+        for f in files_to_open:
             try:
                 if os.name == 'nt':
                     npp_path = r'C:\Program Files\Notepad++\notepad++.exe'
                     if os.path.exists(npp_path):
-                        subprocess.Popen([npp_path, f])
+                        subprocess.Popen([npp_path, f])  # type: ignore
                     else:
-                        subprocess.Popen(['notepad.exe', f])
+                        subprocess.Popen(['notepad.exe', f])  # type: ignore
                 else:
-                    subprocess.Popen(['xdg-open', f])
+                    subprocess.Popen(['xdg-open', f])  # type: ignore
             except Exception:
                 pass
     
-    @kb.add('c')
-    def _(event):
+    @kb.add('c')  # type: ignore  # noqa  # type: ignore  # noqa
+    def _(event: Any) -> None:
         block = get_current_block()
         if block:
             for_copy = []
@@ -1145,17 +1145,17 @@ def interactive_viewer(grouped: List[Dict]) -> None:
                 lineno = f'{block["start_line"] + i:>4} | '
                 for_copy.append(lineno + line)
             selected_code = '\n'.join(for_copy)
-            if PYPERCLIP_AVAILABLE:
+            if PYPERCLIP_AVAILABLE and pyperclip is not None:
                 try:
-                    pyperclip.copy(selected_code)
+                    pyperclip.copy(selected_code)  # type: ignore
                     print(f'Код скопирован в буфер обмена.')
                 except Exception as e:
                     print(f'Ошибка копирования: {e}\nКод:\n{selected_code}')
             else:
                 print(f'Код для копирования:\n{selected_code}')
     
-    @kb.add('g')
-    async def _(event):
+    @kb.add('g')  # type: ignore  # noqa  # type: ignore  # noqa
+    async def _(event: Any) -> None:
         block = get_current_block()
         if not block:
             return
@@ -1168,7 +1168,7 @@ def interactive_viewer(grouped: List[Dict]) -> None:
                 npp_path = r'C:\Program Files\Notepad++\notepad++.exe'
                 code, start_line, lang = preview_code_around_comment(block, context=3)
                 code_lines = code.splitlines(keepends=False)
-                comment_lines = [line for line in block['lines'] if line.strip()]
+                comment_lines = [l for l in block['lines'] if l.strip()]
                 comment_indices = sorted(find_comment_block_in_code([l.rstrip('\n') for l in code_lines], comment_lines))
                 
                 if comment_indices:
@@ -1181,31 +1181,31 @@ def interactive_viewer(grouped: List[Dict]) -> None:
                     goto_col = 1
                 
                 if npp:
-                    subprocess.Popen(['notepad++', f'-n{goto_line}', f'-c{goto_col}', f])
+                    subprocess.Popen(['notepad++', f'-n{goto_line}', f'-c{goto_col}', f])  # type: ignore
                 elif os.path.exists(npp_path):
-                    subprocess.Popen([npp_path, f'-n{goto_line}', f'-c{goto_col}', f])
+                    subprocess.Popen([npp_path, f'-n{goto_line}', f'-c{goto_col}', f])  # type: ignore
                 else:
-                    subprocess.Popen(['notepad.exe', f])
+                    subprocess.Popen(['notepad.exe', f])  # type: ignore
             elif shutil.which('code'):
-                subprocess.Popen(['code', '-g', f'{f}:{line}'])
+                subprocess.Popen(['code', '-g', f'{f}:{line}'])  # type: ignore
             elif shutil.which('subl'):
-                subprocess.Popen(['subl', f'{f}:{line}'])
+                subprocess.Popen(['subl', f'{f}:{line}'])  # type: ignore
             elif shutil.which('gedit'):
-                subprocess.Popen(['gedit', f'+{line}', f])
+                subprocess.Popen(['gedit', f'+{line}', f])  # type: ignore
             else:
-                subprocess.Popen(['xdg-open', f])
+                subprocess.Popen(['xdg-open', f])  # type: ignore
         except Exception as e:
-            await message_dialog(title='Ошибка', text=f'Не удалось открыть файл: {e}').run_async()
+            await message_dialog(title='Ошибка', text=f'Не удалось открыть файл: {e}').run_async()  # type: ignore
     
-    @kb.add('q')
-    def _(event):
+    @kb.add('q')  # type: ignore  # noqa  # type: ignore  # noqa
+    def _(event: Any) -> None:
         event.app.exit()
     
-    body = Window(content=FormattedTextControl(render), always_hide_cursor=True)
-    frame = Frame(body, title='find_comments.py — Interactive')
-    layout = Layout(HSplit([frame]))
-    app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)
-    app.run()
+    body = Window(content=FormattedTextControl(render), always_hide_cursor=True)  # type: ignore
+    frame = Frame(body, title='find_comments.py — Interactive')  # type: ignore
+    layout = Layout(HSplit([frame]))  # type: ignore
+    app = Application(layout=layout, key_bindings=kb, style=style, full_screen=True)  # type: ignore
+    app.run()  # type: ignore
 
 
 def _simple_interactive_viewer(grouped: List[Dict]) -> None:
@@ -1258,6 +1258,7 @@ def _simple_interactive_viewer(grouped: List[Dict]) -> None:
                 idx = 0
                 filter_type = None
         elif cmd == 'o' and filtered:
+            block = filtered[idx]  # type: ignore
             f = block['file']
             try:
                 if os.name == 'nt':
@@ -1272,20 +1273,20 @@ def _simple_interactive_viewer(grouped: List[Dict]) -> None:
                 print(f'Ошибка открытия файла: {e}')
                 input('Нажмите Enter...')
         elif cmd == 'a':
-            files = sorted(set(b['file'] for b in filtered))
-            for f in files:
+            files_to_open = sorted(set(b['file'] for b in filtered))
+            for f in files_to_open:
                 try:
                     if os.name == 'nt':
                         npp_path = r'C:\Program Files\Notepad++\notepad++.exe'
                         if os.path.exists(npp_path):
-                            subprocess.Popen([npp_path, f])
+                            subprocess.Popen([npp_path, f])  # type: ignore
                         else:
-                            subprocess.Popen(['notepad.exe', f])
+                            subprocess.Popen(['notepad.exe', f])  # type: ignore
                     else:
-                        subprocess.Popen(['xdg-open', f])
+                        subprocess.Popen(['xdg-open', f])  # type: ignore
                 except Exception as e:
                     print(f'Ошибка открытия файла: {e}')
-            input(f'Открыто файлов: {len(files)}. Нажмите Enter...')
+            input(f'Открыто файлов: {len(files_to_open)}. Нажмите Enter...')
         elif cmd == 'e':
             fmt = input('Формат экспорта (md/csv/txt/html/json/pdf): ').strip()
             fname = input('Имя файла для экспорта: ').strip()
@@ -1301,9 +1302,9 @@ def _simple_interactive_viewer(grouped: List[Dict]) -> None:
                 lineno = f'{block["start_line"] + i:>4} | '
                 for_copy.append(lineno + line)
             selected_code = '\n'.join(for_copy)
-            if PYPERCLIP_AVAILABLE:
+            if PYPERCLIP_AVAILABLE and pyperclip is not None:
                 try:
-                    pyperclip.copy(selected_code)
+                    pyperclip.copy(selected_code)  # type: ignore
                     print(f'Код скопирован в буфер обмена.')
                 except Exception as e:
                     print(f'Ошибка копирования: {e}\nКод:\n{selected_code}')
@@ -1403,16 +1404,12 @@ def get_parser(lang: str) -> argparse.ArgumentParser:
 def main() -> None:
     """Точка входа"""
     # Определяем язык
+    lang = 'en'  # значение по умолчанию
     if '--lang' in sys.argv:
         lang_idx = sys.argv.index('--lang')
         if lang_idx + 1 < len(sys.argv):
-            lang = sys.argv[lang_idx + 1] if sys.argv[lang_idx + 1] in ['en', 'ru'] else None
-        else:
-            lang = None
+            lang = sys.argv[lang_idx + 1] if sys.argv[lang_idx + 1] in ['en', 'ru'] else 'en'
     else:
-        lang = None
-    
-    if lang is None:
         sys_lang = locale.getlocale()[0]
         lang = 'ru' if sys_lang and sys_lang.lower().startswith('ru') else 'en'
     
@@ -1437,7 +1434,7 @@ def main() -> None:
         print(f"\033[93m{L['notepadpp_recommend']}\033[0m")
     
     # Собираем список файлов, если указаны --files или --filelist
-    files_from_args = []
+    files_from_args: List[str] = []
     if args.files:
         files_from_args.extend(args.files)
     if args.filelist:
@@ -1460,9 +1457,9 @@ def main() -> None:
     # Загружаем плагины
     plugin_patterns = load_plugins(args.plugin) if args.plugin else {}
     
-    comments = []
-    files = []
-    errors = []
+    comments: List[Dict] = []
+    files: List[str] = []
+    errors: List[str] = []
     
     if expanded_files:
         # Режим работы с конкретными файлами
@@ -1500,9 +1497,13 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             futures = [executor.submit(process_file, filepath) for filepath in files_to_scan]
             if args.show_progress:
-                from tqdm import tqdm
-                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
-                    comments.extend(future.result())
+                try:
+                    from tqdm import tqdm
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+                        comments.extend(future.result())
+                except ImportError:
+                    for future in as_completed(futures):
+                        comments.extend(future.result())
             else:
                 for future in as_completed(futures):
                     comments.extend(future.result())
@@ -1539,7 +1540,7 @@ def main() -> None:
         cache_changed = False
         cache_lock = threading.Lock()
         
-        def process_file_with_idx(idx_file):
+        def process_file_with_idx(idx_file: Tuple[int, str]) -> List[Dict]:
             idx, filepath = idx_file
             if args.show_progress:
                 print(f"[{idx}/{total}] Обработка файла: {filepath}")
@@ -1583,7 +1584,7 @@ def main() -> None:
         
         if args.contains:
             contains_res = [re.compile(pat, re.IGNORECASE) for pat in args.contains]
-            def block_matches(block):
+            def block_matches(block: Dict) -> bool:
                 text = '\n'.join(block['lines'])
                 return any(r.search(text) for r in contains_res)
             grouped = [g for g in grouped if block_matches(g)]
@@ -1592,7 +1593,7 @@ def main() -> None:
         exit_code = 0
         if args.fail_on:
             fail_res = [re.compile(pat, re.IGNORECASE) for pat in args.fail_on]
-            def block_fails(block):
+            def block_fails(block: Dict) -> bool:
                 text = '\n'.join(block['lines'])
                 return any(r.search(text) for r in fail_res)
             failed = [g for g in grouped if block_fails(g)]
@@ -1623,7 +1624,6 @@ def main() -> None:
             elif args.format in save_map:
                 save_map[args.format](comments, args.out)
                 print(L['saved'].format(out=args.out, fmt=args.format))
-                print((f"Результат сохранён в: {args.out}" if args.lang == 'ru' else f"Output saved to: {args.out}"))
         
         # Генерация отчёта
         if args.report:
