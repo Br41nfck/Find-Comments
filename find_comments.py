@@ -4,7 +4,7 @@ find_comments.py — универсальный инструмент для по
 
 Автор: Trix
 GitHub: https://github.com/Br41nfck/Find-Comments
-Version: 1.5.0
+Version: 1.5.1
 """
 
 import os
@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple, Optional, Set, Union, TYPE_CHECKING
 
 # Version
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # Try to import optional dependencies
 try:
@@ -133,7 +133,8 @@ def _get_compiled_regex(pattern: str) -> re.Pattern:  # type: ignore
     return _REGEX_CACHE[pattern]
 
 # Предкомпилированные паттерны для оптимизации
-_COMMENT_SYMBOL_PATTERN = re.compile(r'^\s*(///+|//+|#+|/\*+|\*+/)')
+_COMMENT_SYMBOL_PATTERN = re.compile(r'^\s*(?:///+|//+|#+|/\*+|\*+(?!/)|<!--+|' + '"' * 3 + '|' + "'" * 3 + ')')
+_COMMENT_SUFFIX_PATTERN = re.compile(r'(?:\*+/|-->|' + '"' * 3 + '|' + "'" * 3 + r')\s*$')
 _SUMMARY_TAG_PATTERN = re.compile(r'</?summary>', re.IGNORECASE)
 _DISPLAY_SYMBOLS_PATTERN = re.compile(r'^\s*(///+|//+|#+|/\*+|\*+/)')
 _DISPLAY_TAGS_PATTERN = re.compile(r'<!--+|-->|<summary>|</summary>', re.IGNORECASE)
@@ -373,65 +374,76 @@ def find_comments_in_file(filepath: str, patterns: List[Dict]) -> List[Dict]:
             lines = f.readlines()
     except Exception:
         return results
-    
-    # Предкомпилируем паттерны для оптимизации
-    compiled_multi = [(re.compile(pat['start']), re.compile(pat['end'])) for pat in patterns if pat['type'] == 'multi']
-    compiled_single = [re.compile(pat['pattern']) for pat in patterns if pat['type'] == 'single']
-    
-    # Для многострочных комментариев
+
+    compiled_multi = [(re.compile(p['start']), re.compile(p['end'])) for p in patterns if p['type'] == 'multi']
+    compiled_single = [re.compile(p['pattern']) for p in patterns if p['type'] == 'single']
+    covered: Set[int] = set()  # строки, уже попавшие в многострочные комментарии
+
+    # Многострочные комментарии
     for start_pat, end_pat in compiled_multi:
         inside = False
-        comment_lines: List[str] = []
+        buf: List[str] = []
         start_line = 0
         for idx, line in enumerate(lines):
-            if not inside and start_pat.search(line):
-                inside = True
-                start_line = idx + 1
-                comment_lines = [line.rstrip('\n')]
-                if end_pat.search(line) and start_pat.pattern != end_pat.pattern:
+            if not inside:
+                m = start_pat.search(line)
+                if not m:
+                    continue
+                em = end_pat.search(line, m.end())  # конец ищем ПОСЛЕ начала
+                if em:
                     results.append({
                         'file': filepath,
-                        'line': start_line,
+                        'line': idx + 1,
                         'end_line': idx + 1,
-                        'text': line.strip(),
+                        'text': line[m.start():em.end()].strip(),
                         'type': 'multi',
                     })
-                    inside = False
-                    comment_lines = []
-            elif inside:
-                comment_lines.append(line.rstrip('\n'))
+                    covered.add(idx + 1)
+                    continue
+                inside, start_line, buf = True, idx + 1, [line.rstrip('\n')]
+            else:
+                buf.append(line.rstrip('\n'))
                 if end_pat.search(line):
                     results.append({
                         'file': filepath,
                         'line': start_line,
                         'end_line': idx + 1,
-                        'text': '\n'.join(comment_lines),
+                        'text': '\n'.join(buf),
                         'type': 'multi',
                     })
-                    inside = False
-                    comment_lines = []
-        
+                    covered.update(range(start_line, idx + 2))
+                    inside, buf = False, []
+
         if inside:
             results.append({
                 'file': filepath,
                 'line': start_line,
                 'end_line': len(lines),
-                'text': '\n'.join(comment_lines) + '\n[WARNING: Многострочный комментарий не закрыт!]',
+                'text': '\n'.join(buf) + '\n[WARNING: Многострочный комментарий не закрыт!]',
                 'type': 'warning',
             })
-    
-    # Для однострочных комментариев
+            covered.update(range(start_line, len(lines) + 1))
+
+    # Однострочные комментарии (без дубликатов и без строк внутри многострочных)
+    seen: Set[Tuple[int, str]] = set()
     for regex in compiled_single:
         for idx, line in enumerate(lines):
+            if idx + 1 in covered:
+                continue
             m = regex.search(line)
-            if m:
-                results.append({
-                    'file': filepath,
-                    'line': idx + 1,
-                    'end_line': idx + 1,
-                    'text': m.group().strip(),
-                    'type': 'single',
-                })
+            if not m:
+                continue
+            text = m.group().strip()
+            if (idx + 1, text) in seen:
+                continue
+            seen.add((idx + 1, text))
+            results.append({
+                'file': filepath,
+                'line': idx + 1,
+                'end_line': idx + 1,
+                'text': text,
+                'type': 'single',
+            })
     return results
 
 
@@ -473,64 +485,62 @@ def clean_comment_line(line: str, include_symbols: bool = False) -> str:
     if include_symbols:
         return line.strip()
     line = _COMMENT_SYMBOL_PATTERN.sub('', line)
+    line = _COMMENT_SUFFIX_PATTERN.sub('', line)
     line = _SUMMARY_TAG_PATTERN.sub('', line)
     return line.strip()
+
+
+def _clean_comment_text(text: str, include_symbols: bool = False) -> List[str]:
+    """Очищает (возможно многострочный) текст комментария и возвращает непустые строки"""
+    out: List[str] = []
+    for raw in text.split('\n'):
+        t = clean_comment_line(raw, include_symbols)
+        if t:
+            out.append(t)
+    return out
 
 
 def group_comments(comments: List[Dict], include_symbols: bool = False) -> List[Dict]:
     """Группирует подряд идущие комментарии в блоки"""
     grouped: List[Dict] = []
-    i = 0
-    n = len(comments)
-    used: Set[Tuple[str, int]] = set()
-    
+    i, n = 0, len(comments)
+
     while i < n:
         c = comments[i]
-        key = (c['file'], c['line'])
-        if key in used:
-            i += 1
-            continue
-        
-        if c['file'].endswith('.cs') and c['text'].startswith('///'):
-            start = i
+        if (c['type'] == 'single' and c['file'].lower().endswith(('.cs', '.rs'))
+                and c['text'].startswith('///')):
             end = i
-            block_lines: List[str] = []
-            txt = clean_comment_line(c['text'], include_symbols)
-            if txt:
-                block_lines.append(txt)
-            used.add((c['file'], c['line']))
-            
-            while (end + 1 < n and
-                   comments[end + 1]['file'] == c['file'] and
-                   comments[end + 1]['line'] == comments[end]['line'] + 1 and
-                   comments[end + 1]['text'].startswith('///')):
+            raw = [c['text']]
+            while (end + 1 < n
+                   and comments[end + 1]['file'] == c['file']
+                   and comments[end + 1]['type'] == 'single'
+                   and comments[end + 1]['line'] == comments[end]['line'] + 1
+                   and comments[end + 1]['text'].startswith('///')):
                 end += 1
-                txt = clean_comment_line(comments[end]['text'], include_symbols)
-                if txt:
-                    block_lines.append(txt)
-                used.add((comments[end]['file'], comments[end]['line']))
-            
+                raw.append(comments[end]['text'])
+            block_lines = [t for r in raw for t in _clean_comment_text(r, include_symbols)]
             if block_lines:
+                kind = 'summary' if any(_SUMMARY_TAG_PATTERN.search(r) for r in raw) else 'triple_slash'
                 grouped.append({
                     'file': c['file'],
                     'start_line': c['line'],
                     'end_line': comments[end]['line'],
                     'lines': block_lines,
-                    'type': 'triple_slash',
+                    'type': kind,
                 })
             i = end + 1
         else:
-            txt = clean_comment_line(c['text'], include_symbols)
-            if txt:
+            block_lines = _clean_comment_text(c['text'], include_symbols)
+            if block_lines:
                 grouped.append({
                     'file': c['file'],
                     'start_line': c['line'],
                     'end_line': c['end_line'],
-                    'lines': [txt],
-                    'type': 'single' if c['line'] == c['end_line'] else 'multi',
+                    'lines': block_lines,
+                    'type': c['type'],
                 })
             i += 1
-    
+
     return grouped
 
 
@@ -538,18 +548,23 @@ def group_comments(comments: List[Dict], include_symbols: bool = False) -> List[
 _HIGHLIGHT_PATTERN_CACHE: Dict[str, re.Pattern] = {}  # type: ignore
 
 def highlight_text(text: str, highlight_words: List[str]) -> str:
-    """Подсвечивает ключевые слова в тексте"""
-    colors = [Fore.RED, Fore.MAGENTA, Fore.CYAN, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
-    for i, word in enumerate(highlight_words):
-        if not word:
-            continue
-        # Используем кэш для скомпилированных паттернов
-        if word not in _HIGHLIGHT_PATTERN_CACHE:
-            _HIGHLIGHT_PATTERN_CACHE[word] = re.compile(rf'(?i)\b{re.escape(word)}\b')
-        pattern = _HIGHLIGHT_PATTERN_CACHE[word]
-        color = colors[i % len(colors)] + getattr(ColoramaStyle, 'BRIGHT', '')
-        text = pattern.sub(lambda m: color + m.group(0) + getattr(ColoramaStyle, 'RESET_ALL', ''), text)
-    return text
+    """Подсвечивает ключевые слова в тексте (один проход, без порчи ANSI-кодов)"""
+    words = sorted({w for w in highlight_words if w}, key=len, reverse=True)
+    if not words:
+        return text
+    palette = [Fore.RED, Fore.MAGENTA, Fore.CYAN, Fore.YELLOW, Fore.GREEN, Fore.BLUE]
+    bright = getattr(ColoramaStyle, 'BRIGHT', '')
+    reset = getattr(ColoramaStyle, 'RESET_ALL', '')
+    color_of: Dict[str, str] = {}
+    for i, w in enumerate(highlight_words):
+        if w:
+            color_of.setdefault(w.lower(), palette[i % len(palette)] + bright)
+    key = '|'.join(words)
+    pattern = _HIGHLIGHT_PATTERN_CACHE.get(key)
+    if pattern is None:
+        pattern = re.compile(r'(?<!\w)(?:' + '|'.join(re.escape(w) for w in words) + r')(?!\w)', re.IGNORECASE)
+        _HIGHLIGHT_PATTERN_CACHE[key] = pattern
+    return pattern.sub(lambda m: color_of.get(m.group(0).lower(), '') + m.group(0) + reset, text)
 
 
 def print_comments_from_grouped(grouped: List[Dict], show_content: bool = False, 
@@ -611,7 +626,7 @@ def save_html(comments: List[Dict], filename: str) -> None:
         for c in comments:
             f.write(f'<tr><td>{escape(c["file"])}</td><td>{c["line"]}</td><td>{c["end_line"]}</td>'
                    f'<td><pre>{escape(c["text"])}</pre></td></tr>')
-        f.write('</tr></body></html>')
+        f.write('</table></body></html>')
 
 
 def save_pretty_txt(comments: List[Dict], filename: str) -> None:
@@ -672,9 +687,10 @@ def save_html_from_grouped(grouped: List[Dict], filename: str) -> None:
         f.write('<html><head><meta charset="utf-8"><title>Comments</title></head><body>')
         f.write('<table border="1"><tr><th>File</th><th>Start Line</th><th>End Line</th><th>Type</th><th>Text</th></tr>')
         for block in grouped:
+            text = escape('\n'.join(block['lines']))
             f.write(f'<tr><td>{escape(block["file"])}</td><td>{block["start_line"]}</td>'
-                   f'<td>{block["end_line"]}</td><td>{block["type"]}</td>'
-                   f'<td><pre>{escape("\n".join(block["lines"]))}</pre></td></tr>')
+                    f'<td>{block["end_line"]}</td><td>{block["type"]}</td>'
+                    f'<td><pre>{text}</pre></td></tr>')
         f.write('</table></body></html>')
 
 
@@ -682,10 +698,11 @@ def save_txt_from_grouped(grouped: List[Dict], filename: str) -> None:
     """Сохраняет сгруппированные комментарии в TXT"""
     with open(filename, 'w', encoding='utf-8') as f:
         for block in grouped:
-            if block['start_line'] == block['end_line']:
+            if block['start_line'] == block['end_line'] and len(block['lines']) == 1:
                 f.write(f"{block['file']}:{block['start_line']}: {block['lines'][0]}\n")
             else:
-                f.write(f"{block['file']}:{block['start_line']}-{block['end_line']}: {block['lines'][0]}\n")
+                f.write(f"{block['file']}:{block['start_line']}-{block['end_line']}:\n")
+                f.write('\n'.join(block['lines']) + '\n')
 
 
 def load_plugins(plugin_paths: List[str]) -> Dict:
@@ -709,6 +726,39 @@ def load_plugins(plugin_paths: List[str]) -> Dict:
         except Exception as e:
             print(f"[PLUGIN ERROR] {path}: {e}")
     return plugin_patterns
+
+
+_PDF_FONTS = ['Helvetica', 'Helvetica-Bold']
+
+
+def _setup_pdf_fonts() -> None:
+    """Регистрирует Unicode-шрифт (DejaVu/Arial), чтобы кириллица в PDF отображалась корректно"""
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return
+    dirs = [
+        os.path.dirname(os.path.abspath(__file__)),
+        '/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/dejavu', '/usr/share/fonts/TTF',
+        '/Library/Fonts', '/System/Library/Fonts/Supplemental', os.path.expanduser('~/Library/Fonts'),
+        r'C:\Windows\Fonts',
+    ]
+    candidates = [('DejaVuSans.ttf', 'DejaVuSans-Bold.ttf'), ('arial.ttf', 'arialbd.ttf'), ('Arial.ttf', 'Arial Bold.ttf')]
+    for d in dirs:
+        for reg, bold in candidates:
+            reg_path, bold_path = os.path.join(d, reg), os.path.join(d, bold)
+            if os.path.isfile(reg_path):
+                try:
+                    pdfmetrics.registerFont(TTFont('FCUni', reg_path))
+                    if os.path.isfile(bold_path):
+                        pdfmetrics.registerFont(TTFont('FCUni-Bold', bold_path))
+                        _PDF_FONTS[:] = ['FCUni', 'FCUni-Bold']
+                    else:
+                        _PDF_FONTS[:] = ['FCUni', 'FCUni']
+                    return
+                except Exception:
+                    continue
 
 
 def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'md', 
@@ -761,11 +811,13 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
         report = '\n'.join(lines)
         
     elif report_type == 'csv':
-        output = []
-        output.append(','.join(['file', 'comments', 'lines']))
+        import io
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator='\n')
+        writer.writerow(['file', 'comments', 'lines'])
         for f in sorted(file_counter, key=lambda x: -file_counter[x]):
-            output.append(f"{f},{file_counter[f]},{file_lines.get(f, '?')}")
-        report = '\n'.join(output)
+            writer.writerow([f, file_counter[f], file_lines.get(f, '?')])
+        report = buf.getvalue()
         
     elif report_type == 'html':
         lines = [
@@ -832,7 +884,10 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             return None
         
         story = []
+        _setup_pdf_fonts()
         styles = getSampleStyleSheet()  # type: ignore
+        for _name in ('Title', 'Heading2', 'Normal'):
+            styles[_name].fontName = _PDF_FONTS[0] if _name == 'Normal' else _PDF_FONTS[1]  # type: ignore
         story.append(Paragraph('Аналитика по комментариям', styles['Title']))  # type: ignore
         story.append(Paragraph(f'Всего файлов: {len(files)}<br/>Всего блоков комментариев: {comments_total}<br/>'
                               f'Комментариев на 1000 строк кода: {comments_per_kloc:.2f}', styles['Normal']))  # type: ignore
@@ -846,9 +901,10 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 0), (-1, 0), _PDF_FONTS[1]),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('FONTNAME', (0, 1), (-1, -1), _PDF_FONTS[0]),
         ]))
         story.append(table)
         story.append(Spacer(1, 8))  # type: ignore
@@ -861,9 +917,10 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 0), (-1, 0), _PDF_FONTS[1]),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('FONTNAME', (0, 1), (-1, -1), _PDF_FONTS[0]),
         ]))
         story.append(table)
         story.append(Spacer(1, 8))  # type: ignore
@@ -876,9 +933,10 @@ def generate_report(grouped: List[Dict], files: List[str], report_type: str = 'm
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (0, 0), (-1, 0), _PDF_FONTS[1]),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('FONTNAME', (0, 1), (-1, -1), _PDF_FONTS[0]),
         ]))
         story.append(table)
         
@@ -1025,7 +1083,7 @@ def interactive_viewer(grouped: List[Dict]) -> None:
             code, start_line, lang = preview_code_around_comment(block, context=3, use_rich=True)
             code_lines = code.splitlines(keepends=True)
             comment_lines = [line for line in block['lines'] if line.strip()]
-            comment_indices = find_comment_block_in_code([l.rstrip('\n') for l in code_lines], comment_lines)
+            comment_indices = set(range(block['start_line'] - start_line, block['end_line'] - start_line + 1))
             
             for i, line in enumerate(code_lines):
                 lineno = f'{start_line + i:>4} | '
@@ -1100,7 +1158,7 @@ def interactive_viewer(grouped: List[Dict]) -> None:
     async def _(event: Any) -> None:
         fmt = await input_dialog(title='Экспорт', text='Формат экспорта (md/csv/txt/html/json/pdf):').run_async()  # type: ignore
         fname = await input_dialog(title='Экспорт', text='Имя файла для экспорта:').run_async()  # type: ignore
-        if fmt and isinstance(fmt, str) and fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
+        if fname and isinstance(fname, str) and fmt and isinstance(fmt, str) and fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
             generate_report(filtered[0], sorted(set(b['file'] for b in filtered[0])), report_type=fmt, filename=fname)
         event.app.invalidate()
     
@@ -1169,7 +1227,7 @@ def interactive_viewer(grouped: List[Dict]) -> None:
                 code, start_line, lang = preview_code_around_comment(block, context=3)
                 code_lines = code.splitlines(keepends=False)
                 comment_lines = [l for l in block['lines'] if l.strip()]
-                comment_indices = sorted(find_comment_block_in_code([l.rstrip('\n') for l in code_lines], comment_lines))
+                comment_indices = sorted(range(block['start_line'] - start_line, block['end_line'] - start_line + 1))
                 
                 if comment_indices:
                     goto_line = start_line + comment_indices[0]
@@ -1230,7 +1288,7 @@ def _simple_interactive_viewer(grouped: List[Dict]) -> None:
             code, start_line, _ = preview_code_around_comment(block, context=3)
             code_lines = code.splitlines(keepends=True)
             comment_lines = [line for line in block['lines'] if line.strip()]
-            comment_indices = find_comment_block_in_code([l.rstrip('\n') for l in code_lines], comment_lines)
+            comment_indices = set(range(block['start_line'] - start_line, block['end_line'] - start_line + 1))
             
             print('Код вокруг комментария:')
             for i, line in enumerate(code_lines):
@@ -1290,7 +1348,7 @@ def _simple_interactive_viewer(grouped: List[Dict]) -> None:
         elif cmd == 'e':
             fmt = input('Формат экспорта (md/csv/txt/html/json/pdf): ').strip()
             fname = input('Имя файла для экспорта: ').strip()
-            if fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
+            if fname and fmt in ('md', 'csv', 'txt', 'html', 'json', 'pdf'):
                 generate_report(filtered, sorted(set(b['file'] for b in filtered)), report_type=fmt, filename=fname)
                 input(f'Экспортировано в {fname}. Нажмите Enter...')
             else:
@@ -1401,39 +1459,137 @@ def get_parser(lang: str) -> argparse.ArgumentParser:
     return parser
 
 
+CACHE_PATH = '.comments_cache.json'
+
+
+def scan_files(files: List[str], plugin_patterns: Dict, workers: int, show_progress: bool,
+               errors: List[str]) -> List[Dict]:
+    """Параллельно сканирует файлы, используя кэш"""
+    cache = load_cache(CACHE_PATH)
+    cache_lock = threading.Lock()
+    state = {'changed': False}
+    comments: List[Dict] = []
+
+    def process(filepath: str) -> List[Dict]:
+        patterns = get_patterns_for_ext(os.path.splitext(filepath)[1].lower(), plugin_patterns=plugin_patterns)
+        if not patterns:
+            return []
+        h = file_hash(filepath)
+        if h:
+            # ключ кэша учитывает версию и набор паттернов (в т.ч. плагины)
+            h = f"{h}:{VERSION}:{hashlib.sha256(repr(patterns).encode()).hexdigest()[:12]}"
+            with cache_lock:
+                entry = cache.get(filepath)
+            if entry and entry.get('hash') == h:
+                return entry['comments']
+        try:
+            result = find_comments_in_file(filepath, patterns)
+        except Exception as e:
+            errors.append(f"{filepath}: {e}")
+            return []
+        if h:
+            with cache_lock:
+                cache[filepath] = {'hash': h, 'comments': result}
+                state['changed'] = True
+        return result
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(process, fp) for fp in files]
+        iterator: Any = as_completed(futures)
+        if show_progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(iterator, total=len(futures), desc="Processing files")
+            except ImportError:
+                pass
+        for future in iterator:
+            comments.extend(future.result())
+
+    if state['changed']:
+        save_cache(CACHE_PATH, cache)
+    return comments
+
+
+def open_in_editor(path: str, line: int = 1, col: int = 1) -> bool:
+    """Открывает файл в редакторе на нужной строке"""
+    path = os.path.abspath(path)
+    try:
+        if os.name == 'nt':
+            editor = shutil.which('notepad++')
+            default_npp = r'C:\Program Files\Notepad++\notepad++.exe'
+            if not editor and os.path.isfile(default_npp):
+                editor = default_npp
+            cmd = [editor, f'-n{line}', f'-c{col}', path] if editor else ['notepad.exe', path]
+        elif shutil.which('code'):
+            cmd = ['code', '-g', f'{path}:{line}']
+        elif shutil.which('subl'):
+            cmd = ['subl', f'{path}:{line}']
+        elif shutil.which('gedit'):
+            cmd = ['gedit', f'+{line}', path]
+        elif sys.platform == 'darwin':
+            cmd = ['open', path]
+        else:
+            cmd = ['xdg-open', path]
+        subprocess.Popen(cmd)
+        return True
+    except Exception:
+        return False
+
+
+def _edit_command(edit: List[str]) -> int:
+    """Обработка --edit FILE LINE. Возвращает код выхода"""
+    file_path, line_str = edit
+    try:
+        line = int(line_str)
+        if line < 1:
+            raise ValueError
+    except ValueError:
+        print(f"[ERROR] Invalid line number: {line_str}. Must be a positive integer.", file=sys.stderr)
+        return 2
+    abs_path = os.path.abspath(file_path)
+    if not os.path.isfile(abs_path):
+        print(f"[ERROR] File not found: {abs_path}", file=sys.stderr)
+        return 3
+    if not open_in_editor(abs_path, line):
+        print("[ERROR] Failed to open editor", file=sys.stderr)
+        return 5
+    return 0
+
+
 def main() -> None:
     """Точка входа"""
-    # Определяем язык
-    lang = 'en'  # значение по умолчанию
-    if '--lang' in sys.argv:
-        lang_idx = sys.argv.index('--lang')
-        if lang_idx + 1 < len(sys.argv):
-            lang = sys.argv[lang_idx + 1] if sys.argv[lang_idx + 1] in ['en', 'ru'] else 'en'
-    else:
+    # Определяем язык (поддерживается и --lang ru, и --lang=ru)
+    lang = None
+    for i, a in enumerate(sys.argv):
+        if a == '--lang' and i + 1 < len(sys.argv):
+            lang = sys.argv[i + 1]
+        elif a.startswith('--lang='):
+            lang = a.split('=', 1)[1]
+    if lang not in LOCALES:
         sys_lang = locale.getlocale()[0]
         lang = 'ru' if sys_lang and sys_lang.lower().startswith('ru') else 'en'
-    
-    # Проверка на --support-lang
+
     if '--support-lang' in sys.argv:
         print_supported_languages()
         sys.exit(0)
-    
-    # Проверка на --version
+
     if '--version' in sys.argv:
         print(f"find_comments.py version {VERSION}")
         sys.exit(0)
-    
-    # Создаём парсер
+
     parser = get_parser(lang)
     args = parser.parse_args()
-    
     L = LOCALES[args.lang]
-    
+
+    # --edit не требует сканирования
+    if args.edit:
+        sys.exit(_edit_command(args.edit))
+
     # Рекомендуется Notepad++ на Windows
     if os.name == 'nt' and shutil.which('notepad++') is None:
         print(f"\033[93m{L['notepadpp_recommend']}\033[0m")
-    
-    # Собираем список файлов, если указаны --files или --filelist
+
+    # Файлы из --files / --filelist
     files_from_args: List[str] = []
     if args.files:
         files_from_args.extend(args.files)
@@ -1444,244 +1600,120 @@ def main() -> None:
         except Exception as e:
             print(f"[ERROR] Не удалось прочитать файл со списком файлов: {e}", file=sys.stderr)
             sys.exit(1)
-    
-    # Расширяем wildcard пути
-    expanded_files = []
+
+    expanded_files: List[str] = []
     for path in files_from_args:
         if '*' in path or '?' in path or ('[' in path and ']' in path):
-            expanded = glob.glob(path, recursive=True)
-            expanded_files.extend([os.path.abspath(f) for f in expanded])
+            expanded_files.extend(os.path.abspath(p) for p in glob.glob(path, recursive=True))
         else:
             expanded_files.append(os.path.abspath(path))
-    
-    # Загружаем плагины
+    expanded_files = list(dict.fromkeys(expanded_files))
+
     plugin_patterns = load_plugins(args.plugin) if args.plugin else {}
-    
-    comments: List[Dict] = []
-    files: List[str] = []
     errors: List[str] = []
-    
+    ext_set = {(e if e.startswith('.') else '.' + e).lower() for e in args.ext}
+    script_path = os.path.abspath(__file__)
+    files: List[str] = []
+
     if expanded_files:
-        # Режим работы с конкретными файлами
-        use_cache = True
-        cache_path = '.comments_cache.json'
-        cache = load_cache(cache_path) if use_cache else {}
-        cache_changed = False
-        cache_lock = threading.Lock()
-        
-        script_path = os.path.abspath(__file__)
-        files_to_scan = [f for f in expanded_files 
-                        if os.path.splitext(f)[1].lower() in set(args.ext) 
-                        and os.path.abspath(f) != script_path]
-        files = files_to_scan
-        
-        def process_file(filepath: str) -> List[Dict]:
-            nonlocal cache_changed
-            patterns = get_patterns_for_ext(os.path.splitext(filepath)[1].lower(), plugin_patterns=plugin_patterns)
-            if patterns:
-                h = file_hash(filepath)
-                with cache_lock:
-                    if use_cache and h and filepath in cache and cache[filepath].get('hash') == h:
-                        return cache[filepath]['comments']
-                try:
-                    file_comments = find_comments_in_file(filepath, patterns)
-                    if use_cache and h:
-                        with cache_lock:
-                            cache[filepath] = {'hash': h, 'comments': file_comments}
-                            cache_changed = True
-                    return file_comments
-                except Exception as e:
-                    errors.append(f"{filepath}: {e}")
-            return []
-        
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = [executor.submit(process_file, filepath) for filepath in files_to_scan]
-            if args.show_progress:
-                try:
-                    from tqdm import tqdm
-                    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
-                        comments.extend(future.result())
-                except ImportError:
-                    for future in as_completed(futures):
-                        comments.extend(future.result())
-            else:
-                for future in as_completed(futures):
-                    comments.extend(future.result())
-        
-        if use_cache and cache_changed:
-            save_cache(cache_path, cache)
+        files = [f for f in expanded_files
+                 if os.path.splitext(f)[1].lower() in ext_set and os.path.abspath(f) != script_path]
     else:
-        # Рекурсивный обход директории
         ignore_re = re.compile(args.ignore_regex) if args.ignore_regex else None
-        all_files = []
-        root_depth = args.root.rstrip(os.sep).count(os.sep)
-        script_path = os.path.abspath(__file__)
-        
-        for dirpath, _, filenames in os.walk(args.root):
+        ignore_words = [w.lower() for w in args.ignore]
+        for dirpath, dirnames, filenames in os.walk(args.root):
+            rel = os.path.relpath(dirpath, args.root)
+            depth = 0 if rel == '.' else rel.count(os.sep) + 1
             if args.max_depth is not None:
-                cur_depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
-                if cur_depth >= args.max_depth:
+                if depth >= args.max_depth:
+                    dirnames[:] = []
                     continue
+                if depth + 1 >= args.max_depth:
+                    dirnames[:] = []  # глубже не спускаемся
             for fname in filenames:
-                ext = os.path.splitext(fname)[1].lower()
                 fpath = os.path.join(dirpath, fname)
-                if any(word.lower() in fname.lower() for word in args.ignore):
+                if os.path.splitext(fname)[1].lower() not in ext_set:
+                    continue
+                if any(w in fname.lower() for w in ignore_words):
                     continue
                 if ignore_re and ignore_re.search(fname):
                     continue
-                if ext in set(args.ext) and os.path.abspath(fpath) != script_path:
-                    all_files.append(fpath)
-        
-        files = all_files
-        total = len(files)
-        use_cache = True
-        cache_path = '.comments_cache.json'
-        cache = load_cache(cache_path) if use_cache else {}
-        cache_changed = False
-        cache_lock = threading.Lock()
-        
-        def process_file_with_idx(idx_file: Tuple[int, str]) -> List[Dict]:
-            idx, filepath = idx_file
-            if args.show_progress:
-                print(f"[{idx}/{total}] Обработка файла: {filepath}")
-            patterns = get_patterns_for_ext(os.path.splitext(filepath)[1].lower(), plugin_patterns=plugin_patterns)
-            if patterns:
-                h = file_hash(filepath)
-                with cache_lock:
-                    if use_cache and h and filepath in cache and cache[filepath].get('hash') == h:
-                        return cache[filepath]['comments']
-                try:
-                    file_comments = find_comments_in_file(filepath, patterns)
-                    if use_cache and h:
-                        with cache_lock:
-                            cache[filepath] = {'hash': h, 'comments': file_comments}
-                            cache_changed = True
-                    return file_comments
-                except Exception as e:
-                    errors.append(f"{filepath}: {e}")
-            return []
-        
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = [executor.submit(process_file_with_idx, (idx, filepath)) 
-                      for idx, filepath in enumerate(files, 1)]
-            for future in as_completed(futures):
-                comments.extend(future.result())
-        
-        if use_cache and cache_changed:
-            save_cache(cache_path, cache)
-    
+                if os.path.abspath(fpath) != script_path:
+                    files.append(fpath)
+
+    comments = scan_files(files, plugin_patterns, args.workers, args.show_progress, errors)
+    for err in errors:
+        print(f"[ERROR] {err}", file=sys.stderr)
+
     # Обработка результатов
     try:
         comments.sort(key=lambda c: (c['file'], c['line']))
         grouped = group_comments(comments, include_symbols=args.include_symbols)
-        
+
         # Фильтрация
         if args.only:
             grouped = [g for g in grouped if g['type'] in args.only]
-        
+
         if args.min_lines > 0:
             grouped = [g for g in grouped if len(g['lines']) >= args.min_lines]
-        
+
         if args.contains:
             contains_res = [re.compile(pat, re.IGNORECASE) for pat in args.contains]
-            def block_matches(block: Dict) -> bool:
-                text = '\n'.join(block['lines'])
-                return any(r.search(text) for r in contains_res)
-            grouped = [g for g in grouped if block_matches(g)]
-        
+            grouped = [g for g in grouped
+                       if any(r.search('\n'.join(g['lines'])) for r in contains_res)]
+
         # Проверка на fail-on
         exit_code = 0
         if args.fail_on:
             fail_res = [re.compile(pat, re.IGNORECASE) for pat in args.fail_on]
-            def block_fails(block: Dict) -> bool:
-                text = '\n'.join(block['lines'])
-                return any(r.search(text) for r in fail_res)
-            failed = [g for g in grouped if block_fails(g)]
+            failed = [g for g in grouped if any(r.search('\n'.join(g['lines'])) for r in fail_res)]
             if failed:
                 print(f"\n{L['ci_fail'].format(n=len(failed))}")
                 exit_code = 1
-        
+
         # Вывод результатов
         print_comments_from_grouped(grouped, show_content=args.show_content, highlight_words=args.highlight)
-        
+
         # Статистика
         files_set = set(g['file'] for g in grouped)
         warnings = sum(1 for g in grouped if g['type'] == 'warning')
         print(f"\n{L['files']}: {len(files_set)} | {L['blocks']}: {len(grouped)} | {L['warnings']}: {warnings}")
         print(f"Текущая рабочая папка: {os.getcwd()}")
-        
-        # Сохранение результата
-        if args.out and args.format:
-            save_map = {
-                'csv': save_csv,
-                'json': save_json,
-                'html': save_html,
-                'txt': save_txt,
-                'prettytxt': save_pretty_txt,
-            }
-            if args.format == 'prettytxt':
-                save_pretty_txt(comments, args.out)
-            elif args.format in save_map:
-                save_map[args.format](comments, args.out)
-                print(L['saved'].format(out=args.out, fmt=args.format))
-        
+
+        # Сохранение результата (с учётом всех фильтров)
+        if args.out:
+            fmt = args.format or os.path.splitext(args.out)[1].lstrip('.').lower()
+            if fmt == 'htm':
+                fmt = 'html'
+            if fmt == 'prettytxt':
+                save_pretty_txt_from_grouped(grouped, args.out, args.root, files, warnings, errors)
+            else:
+                savers = {
+                    'csv': save_csv_from_grouped,
+                    'json': save_json_from_grouped,
+                    'html': save_html_from_grouped,
+                    'txt': save_txt_from_grouped,
+                }
+                if fmt not in savers:
+                    fmt = 'txt'
+                savers[fmt](grouped, args.out)
+            print(L['saved'].format(out=args.out, fmt=fmt))
+
         # Генерация отчёта
         if args.report:
-            generate_report(grouped, files, report_type=args.report, filename=args.report_out)
-            if not args.report_out:
-                report_content = generate_report(grouped, files, report_type=args.report)
-                if report_content:
-                    print(report_content)
-        
+            if args.report in ('xlsx', 'pdf') and not args.report_out:
+                print(f"[ERROR] --report {args.report} requires --report-out", file=sys.stderr)
+            else:
+                content = generate_report(grouped, files, report_type=args.report, filename=args.report_out)
+                if content:
+                    print(content)
+
         # Интерактивный режим
         if args.interactive:
             interactive_viewer(grouped)
-        
-        # Режим редактирования
-        if args.edit:
-            file_path, line_str = args.edit
-            try:
-                line = int(line_str)
-                if line < 1:
-                    raise ValueError
-            except Exception:
-                print(f"[ERROR] Invalid line number: {line_str}. Must be a positive integer.", file=sys.stderr)
-                sys.exit(2)
-            
-            abs_path = os.path.abspath(file_path)
-            if not os.path.isfile(abs_path):
-                print(f"[ERROR] File not found: {abs_path}", file=sys.stderr)
-                sys.exit(3)
-            
-            if os.name == 'nt':
-                editor = shutil.which('notepad++')
-                if not editor:
-                    default_npp = r'C:\Program Files\Notepad++\notepad++.exe'
-                    if os.path.isfile(default_npp):
-                        editor = default_npp
-                
-                if editor:
-                    cmd = [editor, f'-n{line}', abs_path]
-                else:
-                    print('[WARN] Notepad++ not found, using Notepad (no line support)')
-                    editor = shutil.which('notepad')
-                    if not editor:
-                        print('[ERROR] Notepad not found in PATH.', file=sys.stderr)
-                        sys.exit(4)
-                    cmd = [editor, abs_path]
-                
-                try:
-                    subprocess.Popen(cmd)
-                except Exception as e:
-                    print(f"[ERROR] Failed to open editor: {e}", file=sys.stderr)
-                    sys.exit(5)
-            else:
-                print('[ERROR] --edit supported only on Windows', file=sys.stderr)
-                sys.exit(6)
-            sys.exit(0)
-        
+
         sys.exit(exit_code)
-        
+
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
